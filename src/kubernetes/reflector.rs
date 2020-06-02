@@ -15,10 +15,7 @@ use k8s_openapi::{
 use snafu::Snafu;
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio::{
-    select,
-    time::{delay_for, delay_until},
-};
+use tokio::{select, time::delay_for};
 
 use super::{delayed_delete::DelayedDelete, state};
 
@@ -39,7 +36,7 @@ where
     label_selector: Option<String>,
     resource_version: resource_version::State,
     pause_between_requests: Duration,
-    delayed_delete: DelayedDelete<<W as Watcher>::Object>,
+    delayed_delete: Option<DelayedDelete<<W as Watcher>::Object>>,
 }
 
 impl<W, S> Reflector<W, S>
@@ -55,9 +52,10 @@ where
         field_selector: Option<String>,
         label_selector: Option<String>,
         pause_between_requests: Duration,
+        delay_deletes_for: Option<Duration>,
     ) -> Self {
         let resource_version = resource_version::State::new();
-        let delayed_delete = DelayedDelete::new();
+        let delayed_delete = delay_deletes_for.map(DelayedDelete::new);
         Self {
             watcher,
             state_writer,
@@ -96,7 +94,9 @@ where
                     // begin arriving, reducing the time durig which the state
                     // has no data.
                     self.resource_version.reset();
-                    self.delayed_delete.clear();
+                    if let Some(ref mut delayed_delete) = self.delayed_delete {
+                        delayed_delete.clear();
+                    }
                     self.state_writer.resync();
                     continue;
                 }
@@ -109,27 +109,39 @@ where
 
             pin_mut!(stream);
             loop {
-                let next_delayed_delete_deadline = self.delayed_delete.next_deadline();
-                let delayed_delete_deadline =
-                    next_delayed_delete_deadline.map(|instant| delay_until(instant.into()));
-                select! {
-                    _ = delayed_delete_deadline.expect("crash here"), if delayed_delete_deadline.is_some() => {
-                        // Delayed delete deadline expired first - perform the
-                        // deletions.
-                        self.delayed_delete.perform(&mut self.state_writer);
-                    }
-                    val = stream.next() => {
-                        if let Some(item) = val {
-                            // A new item arrived from the watch response stream
-                            // first - process it.
-                            self.process_stream_item(item)?;
-                        } else {
-                            // Response stream has ended.
-                            // Break the watch reading loop so the flow can
-                            // continue an issue a new watch request.
-                            break;
+                // Obtain an value from the watch stream.
+                let val = if let Some(ref mut delayed_delete) = self.delayed_delete {
+                    // If delayed delete is requested, we perform the delayed
+                    // deletions concurrently to reading items from the watch
+                    // responses stream.
+                    let (delayed_delete_delay, should_poll_delayed_delete_delay) =
+                        delayed_delete.next_deadline_delay();
+                    select! {
+                        // If we get a delayted delete deadline - process the
+                        // delayed deletes and restart the loop.
+                        _ = delayed_delete_delay, if should_poll_delayed_delete_delay => {
+                            delayed_delete.perform(&mut self.state_writer);
+                            continue;
                         }
+                        // If we got a value from the watch responses stream -
+                        // just pass it outside.
+                        val = stream.next() => val,
                     }
+                } else {
+                    // Delayed deletes aren't requested, so just wait for the
+                    // next value and pass it outside.
+                    stream.next().await
+                };
+
+                if let Some(item) = val {
+                    // A new item arrived from the watch response stream
+                    // first - process it.
+                    self.process_stream_item(item)?;
+                } else {
+                    // Response stream has ended.
+                    // Break the watch reading loop so the flow can
+                    // continue an issue a new watch request.
+                    break;
                 }
             }
 
@@ -213,8 +225,11 @@ where
             }
             WatchEvent::Deleted(object) => {
                 trace!(message = "got an object event", event = "deleted");
-                self.delayed_delete
-                    .schedule_delete(object, Duration::from_secs(60));
+                if let Some(ref mut delayed_delete) = self.delayed_delete {
+                    delayed_delete.schedule_delete(object);
+                } else {
+                    self.state_writer.delete(object);
+                }
             }
             WatchEvent::Modified(object) => {
                 trace!(message = "got an object event", event = "modified");
@@ -342,8 +357,14 @@ mod tests {
 
         // Prepare watcher and reflector.
         let watcher: MockWatcher<Pod, _> = MockWatcher::new(mock_logic);
-        let mut reflector =
-            Reflector::new(watcher, state_writer, None, None, Duration::from_secs(1));
+        let mut reflector = Reflector::new(
+            watcher,
+            state_writer,
+            None,
+            None,
+            Duration::from_secs(1),
+            None,
+        );
 
         // Acquire an async context to run the relector.
         test_util::block_on_std(async move {
@@ -410,8 +431,14 @@ mod tests {
 
         // Prepare watcher and reflector.
         let watcher: MockWatcher<Pod, _> = MockWatcher::new(mock_logic);
-        let mut reflector =
-            Reflector::new(watcher, state_writer, None, None, Duration::from_secs(1));
+        let mut reflector = Reflector::new(
+            watcher,
+            state_writer,
+            None,
+            None,
+            Duration::from_secs(1),
+            None,
+        );
 
         // Acquire an async context to run the relector.
         test_util::block_on_std(async move {
@@ -561,6 +588,7 @@ mod tests {
             Some("fields".to_owned()),
             Some("labels".to_owned()),
             Duration::from_secs(1),
+            Some(Duration::from_secs(60)),
         );
 
         // Acquire an async context to run the relector.
