@@ -605,4 +605,121 @@ mod tests {
             drop(reflector);
         });
     }
+
+    // A helper function to run a flow test.
+    // Use this to test various flows without an actual test repetition.
+    fn run_flow_test2(
+        invocations: Vec<(StateSnapshot, Option<String>, ExpInvRes)>,
+        expected_resulting_state: StateSnapshot,
+    ) {
+        // Prepare the test flow.
+        let (state_reader, state_writer) = evmap10::new();
+        let state_writer = Writer::new(state_writer);
+
+        let assertion_state_reader = state_reader.clone();
+        let flow_expected_resulting_state = expected_resulting_state.clone();
+
+        let mut flow_invocations = invocations.into_iter();
+
+        let mock_logic = move |watch_optional: WatchOptional<'_>| {
+            if let Some((
+                expected_state_before_op,
+                expected_resource_version,
+                expected_invocation_response,
+            )) = flow_invocations.next()
+            {
+                // Assert the state prior to the operation.
+                let state: StateSnapshot = gather_state(&assertion_state_reader);
+                assert_eq!(state, expected_state_before_op);
+
+                assert_eq!(
+                    expected_resource_version,
+                    watch_optional.resource_version.map(ToOwned::to_owned) // work around the borrow checker issues
+                );
+
+                let responses = match expected_invocation_response {
+                    ExpInvRes::Stream(responses) => responses,
+                    ExpInvRes::Desync => {
+                        return Err(watcher::invocation::Error::desync(InvocationError))
+                    }
+                };
+
+                let mut responses_iter = responses.into_iter();
+                return Ok(move || responses_iter.next().map(|val| Ok(WatchResponse::Ok(val))));
+            }
+
+            let resulting_state: StateSnapshot = gather_state(&assertion_state_reader);
+            assert_eq!(resulting_state, flow_expected_resulting_state);
+
+            Err(watcher::invocation::Error::other(InvocationError))
+        };
+
+        // Prepare watcher and reflector.
+        let watcher: MockWatcher<Pod, _> = MockWatcher::new(mock_logic);
+        let mut reflector = Reflector::new(
+            watcher,
+            state_writer,
+            None,
+            None,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(60_000)),
+        );
+
+        // Acquire an async context to run the relector.
+        test_util::block_on_std(async move {
+            // Run the test and wait for an error.
+            let result = reflector.run().await;
+            // The only way reflector completes is with an error, but that's ok.
+            // In tests we make it exit with an error to complete the test.
+            result.unwrap_err();
+
+            // Assert the state after the reflector exit.
+            let resulting_state: StateSnapshot = gather_state(&state_reader);
+            assert_eq!(resulting_state, expected_resulting_state);
+
+            // Explicitly drop the reflector at the very end.
+            // Internal evmap is dropped with the reflector, so readers won't
+            // work after drop.
+            drop(reflector);
+        });
+    }
+
+    // Test the properies of the flow with desync.
+    #[test]
+    fn qweqwe() {
+        test_util::trace_init();
+
+        let invocations = vec![
+            (
+                vec![],
+                None,
+                ExpInvRes::Stream(vec![
+                    WatchEvent::Added(make_pod("uid0", "10")),
+                    WatchEvent::Added(make_pod("uid1", "15")),
+                ]),
+            ),
+            (
+                vec![make_pod("uid0", "10"), make_pod("uid1", "15")],
+                Some("15".to_owned()),
+                ExpInvRes::Desync,
+            ),
+            (
+                vec![make_pod("uid0", "10"), make_pod("uid1", "15")],
+                None,
+                ExpInvRes::Stream(vec![
+                    WatchEvent::Added(make_pod("uid20", "1000")),
+                    WatchEvent::Added(make_pod("uid21", "1005")),
+                ]),
+            ),
+            (
+                vec![make_pod("uid20", "1000"), make_pod("uid21", "1005")],
+                Some("1005".to_owned()),
+                ExpInvRes::Stream(vec![WatchEvent::Modified(make_pod("uid21", "1010"))]),
+            ),
+        ];
+        let expected_resulting_state = vec![make_pod("uid20", "1000"), make_pod("uid21", "1010")];
+
+        // Use standard flow test logic.
+        run_flow_test2(invocations, expected_resulting_state);
+    }
 }
